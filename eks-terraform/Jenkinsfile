@@ -12,11 +12,8 @@ pipeline {
     environment {
         FRONTEND_IMAGE = 'peterukpabi4/eks-react-todo'
         BACKEND_IMAGE  = 'peterukpabi4/eks-react-todo-backend'
-        TAG = "${env.BUILD_NUMBER}"
+        TAG = "${BUILD_NUMBER}"
 
-        AWS_CREDENTIALS = credentials('aws-credentials')
-        AWS_ACCESS_KEY_ID = "${env.AWS_CREDENTIALS_USR}"
-        AWS_SECRET_ACCESS_KEY = "${env.AWS_CREDENTIALS_PSW}"
         AWS_DEFAULT_REGION = 'us-east-1'
 
         EKS_CLUSTER_NAME = 'dive-app-cluster'
@@ -38,39 +35,47 @@ pipeline {
         stage('Terraform - Create/Update EKS Cluster') {
             when { expression { params.SKIP_INFRA == false } }
             steps {
-                dir('eks-terraform') {
-                    sh '''
-                    terraform init
-                    terraform plan -out=tfplan
-                    terraform apply -auto-approve tfplan
-                    '''
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding',
+                     credentialsId: 'aws-credentials']
+                ]) {
+                    dir('eks-terraform') {
+                        sh '''
+                        export AWS_DEFAULT_REGION=us-east-1
+
+                        aws sts get-caller-identity
+
+                        terraform init
+                        terraform validate
+                        terraform plan -out=tfplan
+                        terraform apply -auto-approve tfplan
+                        '''
+                    }
                 }
             }
         }
 
-       stage('Configure AWS and EKS') {
-    steps {
-        withCredentials([usernamePassword(
-            credentialsId: 'aws-credentials',
-            usernameVariable: 'AWS_ACCESS_KEY_ID',
-            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
-        )]) {
-            sh '''
-            aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID"
-            aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
-            aws configure set region us-east-1
+        stage('Configure AWS and EKS') {
+            steps {
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding',
+                     credentialsId: 'aws-credentials']
+                ]) {
+                    sh '''
+                    export AWS_DEFAULT_REGION=us-east-1
 
-            aws sts get-caller-identity
+                    aws sts get-caller-identity
 
-            aws eks update-kubeconfig --region us-east-1 --name dive-app-cluster
+                    aws eks update-kubeconfig \
+                      --region us-east-1 \
+                      --name dive-app-cluster
 
-            kubectl cluster-info
-            kubectl get nodes
-            '''
+                    kubectl cluster-info
+                    kubectl get nodes
+                    '''
+                }
+            }
         }
-    }
-}
-
 
         stage('Docker Login') {
             steps {
@@ -99,19 +104,19 @@ pipeline {
 
         stage('Push Docker Images') {
             steps {
-                sh """
+                sh '''
                 docker push ${FRONTEND_IMAGE}:${TAG}
                 docker push ${BACKEND_IMAGE}:${TAG}
-                """
+                '''
             }
         }
 
         stage('Deploy Application to EKS') {
             steps {
                 dir('eks-terraform') {
-                    sh """
-                    sed -i 's|image: peterukpabi4/eks-react-todo:v1|image:${FRONTEND_IMAGE}:${TAG}|g' frontend.yaml
-                    sed -i 's|image: peterukpabi4/eks-react-todo-backend|image:${BACKEND_IMAGE}:${TAG}|g' backend.yaml
+                    sh '''
+                    sed -i "s|image: .*eks-react-todo.*|image: ${FRONTEND_IMAGE}:${TAG}|" frontend.yaml
+                    sed -i "s|image: .*eks-react-todo-backend.*|image: ${BACKEND_IMAGE}:${TAG}|" backend.yaml
 
                     kubectl apply -f configmap.yaml
                     kubectl apply -f secret.yaml
@@ -123,7 +128,7 @@ pipeline {
                     kubectl rollout status deployment/${FRONTEND_APP} --timeout=300s
                     kubectl rollout status deployment/${BACKEND_APP} --timeout=300s
                     kubectl rollout status deployment/${MONGO_APP} --timeout=300s
-                    """
+                    '''
                 }
             }
         }
@@ -132,10 +137,7 @@ pipeline {
     post {
         success {
             echo '✅ Pipeline completed successfully!'
-            sh """
-            kubectl get pods
-            kubectl get svc
-            """
+            sh 'kubectl get pods && kubectl get svc'
         }
         failure {
             echo '❌ Pipeline failed!'
