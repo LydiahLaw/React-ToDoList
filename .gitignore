@@ -1,0 +1,3 @@
+terraform/modules/ec2-modules/my_key*
+.terraform
+terraform.tfstate*
