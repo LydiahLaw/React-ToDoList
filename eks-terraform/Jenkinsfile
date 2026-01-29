@@ -3,25 +3,17 @@ pipeline {
 
     parameters {
         booleanParam(
-            name: 'SKIP_INFRA',
-            defaultValue: true,
-            description: 'Skip EKS cluster creation if it already exists'
+            name: 'DESTROY_INFRA',
+            defaultValue: false,
+            description: ' Destroy ALL Terraform-managed infrastructure (EKS, VPC, etc.)'
         )
     }
 
     environment {
-        FRONTEND_IMAGE = 'peterukpabi4/eks-react-todo'
-        BACKEND_IMAGE  = 'peterukpabi4/eks-react-todo-backend'
-        TAG = "${BUILD_NUMBER}"
-
-        AWS_DEFAULT_REGION = 'us-east-1'
-
-        EKS_CLUSTER_NAME = 'dive-app-cluster'
-        EKS_REGION = 'us-east-1'
-
-        FRONTEND_APP = 'react-todo-frontend'
-        BACKEND_APP  = 'react-todo-backend'
-        MONGO_APP    = 'mongo'
+        AWS_REGION = 'us-east-1'
+        DOCKERHUB_USERNAME = 'your_dockerhub_username'
+        BACKEND_IMAGE = 'react-todo-backend'
+        FRONTEND_IMAGE = 'react-todo-frontend'
     }
 
     stages {
@@ -32,119 +24,130 @@ pipeline {
             }
         }
 
-        stage('Terraform - Create/Update EKS Cluster') {
-            when { expression { params.SKIP_INFRA == false } }
+        stage('Terraform Init & Apply (EKS)') {
+            when {
+                expression { params.DESTROY_INFRA == false }
+            }
             steps {
                 withCredentials([
                     [$class: 'AmazonWebServicesCredentialsBinding',
                      credentialsId: 'aws-credentials']
                 ]) {
-                    dir('eks-terraform') {
+                    dir('terraform/eks') {
                         sh '''
-                        export AWS_DEFAULT_REGION=us-east-1
-
-                        aws sts get-caller-identity
-
-                        terraform init
-                        terraform validate
-                        terraform plan -out=tfplan
-                        terraform apply -auto-approve tfplan
+                          terraform init
+                          terraform validate
+                          terraform apply -auto-approve
                         '''
                     }
                 }
             }
         }
 
-        stage('Configure AWS and EKS') {
+        stage('Configure AWS & EKS') {
+            when {
+                expression { params.DESTROY_INFRA == false }
+            }
             steps {
                 withCredentials([
                     [$class: 'AmazonWebServicesCredentialsBinding',
                      credentialsId: 'aws-credentials']
                 ]) {
                     sh '''
-                    export AWS_DEFAULT_REGION=us-east-1
-
-                    aws sts get-caller-identity
-
-                    aws eks update-kubeconfig \
-                      --region us-east-1 \
-                      --name dive-app-cluster
-
-                    kubectl cluster-info
-                    kubectl get nodes
+                      aws eks update-kubeconfig \
+                        --region $AWS_REGION \
+                        --name my-eks-cluster
                     '''
                 }
             }
         }
 
         stage('Docker Login') {
+            when {
+                expression { params.DESTROY_INFRA == false }
+            }
             steps {
-                withCredentials([usernamePassword(
-                    credentialsId: 'dockerhub-credentials',
-                    usernameVariable: 'DOCKER_USER',
-                    passwordVariable: 'DOCKER_PASS'
-                )]) {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub-credentials',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASS'
+                    )
+                ]) {
                     sh '''
-                    echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                      echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
                     '''
                 }
             }
         }
 
         stage('Build Docker Images') {
-            steps {
-                dir('dive-react-app') {
-                    sh "docker build -t ${FRONTEND_IMAGE}:${TAG} ."
-                }
-                dir('backend') {
-                    sh "docker build -t ${BACKEND_IMAGE}:${TAG} ."
-                }
+            when {
+                expression { params.DESTROY_INFRA == false }
             }
-        }
-
-        stage('Push Docker Images') {
             steps {
                 sh '''
-                docker push ${FRONTEND_IMAGE}:${TAG}
-                docker push ${BACKEND_IMAGE}:${TAG}
+                  docker build -t $DOCKERHUB_USERNAME/$BACKEND_IMAGE:latest backend
+                  docker build -t $DOCKERHUB_USERNAME/$FRONTEND_IMAGE:latest frontend
                 '''
             }
         }
 
-        stage('Deploy Application to EKS') {
+        stage('Push Docker Images') {
+            when {
+                expression { params.DESTROY_INFRA == false }
+            }
             steps {
-                dir('eks-terraform') {
-                    sh '''
-                    sed -i "s|image: .*eks-react-todo.*|image: ${FRONTEND_IMAGE}:${TAG}|" frontend.yaml
-                    sed -i "s|image: .*eks-react-todo-backend.*|image: ${BACKEND_IMAGE}:${TAG}|" backend.yaml
+                sh '''
+                  docker push $DOCKERHUB_USERNAME/$BACKEND_IMAGE:latest
+                  docker push $DOCKERHUB_USERNAME/$FRONTEND_IMAGE:latest
+                '''
+            }
+        }
 
-                    kubectl apply -f configmap.yaml
-                    kubectl apply -f secret.yaml
-                    kubectl apply -f mongo-deployment.yaml
-                    kubectl apply -f mongo-service.yaml
-                    kubectl apply -f frontend.yaml
-                    kubectl apply -f backend.yaml
+        stage('Deploy to EKS') {
+            when {
+                expression { params.DESTROY_INFRA == false }
+            }
+            steps {
+                sh '''
+                  kubectl apply -f k8s/
+                '''
+            }
+        }
 
-                    kubectl rollout status deployment/${FRONTEND_APP} --timeout=300s
-                    kubectl rollout status deployment/${BACKEND_APP} --timeout=300s
-                    kubectl rollout status deployment/${MONGO_APP} --timeout=300s
-                    '''
+        /* ===============================
+           DESTROY STAGE (MANUAL)
+           =============================== */
+        stage('Terraform Destroy (EKS & Infra)') {
+            when {
+                expression { params.DESTROY_INFRA == true }
+            }
+            steps {
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding',
+                     credentialsId: 'aws-credentials']
+                ]) {
+                    dir('terraform/eks') {
+                        sh '''
+                          terraform init
+                          terraform destroy -auto-approve
+                        '''
+                    }
                 }
             }
         }
     }
 
     post {
-        success {
-            echo '✅ Pipeline completed successfully!'
-            sh 'kubectl get pods && kubectl get svc'
+        always {
+            sh 'docker logout || true'
         }
         failure {
-            echo '❌ Pipeline failed!'
+            echo ' Pipeline failed!'
         }
-        always {
-            sh 'docker logout'
-            archiveArtifacts artifacts: '**/*.yaml', allowEmptyArchive: true
+        success {
+            echo ' Pipeline completed successfully!'
         }
     }
 }
